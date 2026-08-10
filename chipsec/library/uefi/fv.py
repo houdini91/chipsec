@@ -175,6 +175,135 @@ EFI_FFS_VOLUME_TOP_FILE_GUID = UUID("1BA0062E-C779-4582-8566-336AE8F78F09")
 
 DEF_INDENT = "    "
 
+#
+# Minimal, dependency-free PE/COFF rebase-0 normalization.
+#
+# The default per-module hash covers the executable section exactly as it sits
+# in the image (i.e. after the module was placed at its load address and its
+# relocations were applied). That value is stable only for a given flash layout.
+# The rebase-0 normalization below zeroes OptionalHeader.ImageBase and reverses
+# every base relocation fixup, producing a layout-independent identity that can
+# be compared across images and against build-time (SBOM) hashes.
+#
+IMAGE_DOS_SIGNATURE = 0x5A4D            # 'MZ'
+IMAGE_NT_OPTIONAL_HDR32_MAGIC = 0x10B   # PE32
+IMAGE_NT_OPTIONAL_HDR64_MAGIC = 0x20B   # PE32+
+IMAGE_DIRECTORY_ENTRY_BASERELOC = 5
+
+IMAGE_REL_BASED_ABSOLUTE = 0            # padding, no fixup
+IMAGE_REL_BASED_HIGHLOW = 3            # 32-bit fixup
+IMAGE_REL_BASED_DIR64 = 10             # 64-bit fixup
+
+
+def _rva_to_offset(rva: int, sections: list) -> Optional[int]:
+    """Map a relative virtual address to a raw file offset using the section table."""
+    for va, vsize, praw, rsize in sections:
+        span = vsize if vsize > rsize else rsize
+        if va <= rva < va + span:
+            return rva - va + praw
+    return None
+
+
+def normalize_pe_rebase0(data: bytes) -> Optional[bytes]:
+    """Return a rebase-0 normalized copy of a PE32/PE32+ image.
+
+    Zeroes OptionalHeader.ImageBase and reverses every base relocation fixup so
+    the returned bytes depend only on the module's code, not on where it was
+    placed. Returns None for TE / non-PE / unparsable or unsupported input
+    (skip, never fake).
+    """
+    try:
+        if len(data) < 0x40 or struct.unpack_from('<H', data, 0)[0] != IMAGE_DOS_SIGNATURE:
+            return None
+        e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
+        if e_lfanew + 24 > len(data) or data[e_lfanew:e_lfanew + 4] != b'PE\x00\x00':
+            return None
+        coff = e_lfanew + 4
+        num_sections = struct.unpack_from('<H', data, coff + 2)[0]
+        size_opt = struct.unpack_from('<H', data, coff + 16)[0]
+        opt = coff + 20
+        magic = struct.unpack_from('<H', data, opt)[0]
+        if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC:
+            imagebase_off = opt + 28
+            imagebase = struct.unpack_from('<I', data, imagebase_off)[0]
+            ib_fmt = '<I'
+            numrva_off = opt + 92
+            dd_off = opt + 96
+        elif magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC:
+            imagebase_off = opt + 24
+            imagebase = struct.unpack_from('<Q', data, imagebase_off)[0]
+            ib_fmt = '<Q'
+            numrva_off = opt + 108
+            dd_off = opt + 112
+        else:
+            return None
+
+        buf = bytearray(data)
+        # Zero ImageBase in the optional header.
+        struct.pack_into(ib_fmt, buf, imagebase_off, 0)
+        # Already rebase-0: header zeroing was a no-op, no fixups to reverse.
+        if imagebase == 0:
+            return bytes(buf)
+
+        num_rva = struct.unpack_from('<I', data, numrva_off)[0]
+        if num_rva <= IMAGE_DIRECTORY_ENTRY_BASERELOC:
+            return bytes(buf)
+        reloc_dd = dd_off + IMAGE_DIRECTORY_ENTRY_BASERELOC * 8
+        reloc_rva, reloc_size = struct.unpack_from('<II', data, reloc_dd)
+        if reloc_rva == 0 or reloc_size == 0:
+            return bytes(buf)
+
+        sec_tbl = opt + size_opt
+        sections = []
+        for i in range(num_sections):
+            sh = sec_tbl + i * 40
+            if sh + 40 > len(data):
+                return None
+            vsize = struct.unpack_from('<I', data, sh + 8)[0]
+            va = struct.unpack_from('<I', data, sh + 12)[0]
+            rsize = struct.unpack_from('<I', data, sh + 16)[0]
+            praw = struct.unpack_from('<I', data, sh + 20)[0]
+            sections.append((va, vsize, praw, rsize))
+
+        reloc_off = _rva_to_offset(reloc_rva, sections)
+        if reloc_off is None or reloc_off + reloc_size > len(buf):
+            return None
+
+        pos = reloc_off
+        end = reloc_off + reloc_size
+        while pos + 8 <= end:
+            page_rva, block_size = struct.unpack_from('<II', buf, pos)
+            if block_size < 8 or pos + block_size > end:
+                break
+            entries = (block_size - 8) // 2
+            eptr = pos + 8
+            for _ in range(entries):
+                entry = struct.unpack_from('<H', buf, eptr)[0]
+                eptr += 2
+                rtype = entry >> 12
+                if rtype == IMAGE_REL_BASED_ABSOLUTE:
+                    continue
+                toff = _rva_to_offset(page_rva + (entry & 0x0FFF), sections)
+                if toff is None:
+                    return None
+                if rtype == IMAGE_REL_BASED_HIGHLOW:
+                    if toff + 4 > len(buf):
+                        return None
+                    val = (struct.unpack_from('<I', buf, toff)[0] - imagebase) & 0xFFFFFFFF
+                    struct.pack_into('<I', buf, toff, val)
+                elif rtype == IMAGE_REL_BASED_DIR64:
+                    if toff + 8 > len(buf):
+                        return None
+                    val = (struct.unpack_from('<Q', buf, toff)[0] - imagebase) & 0xFFFFFFFFFFFFFFFF
+                    struct.pack_into('<Q', buf, toff, val)
+                else:
+                    # Unsupported relocation type: cannot normalize safely.
+                    return None
+            pos += block_size
+        return bytes(buf)
+    except (struct.error, IndexError):
+        return None
+
 
 class EFI_MODULE:
     def __init__(self, Offset: int, Guid: Optional[UUID], HeaderSize: int, Attributes: int, Image: bytes):
@@ -192,6 +321,9 @@ class EFI_MODULE:
         self.MD5 = None
         self.SHA1 = None
         self.SHA256 = None
+        # Optional layout-independent (rebase-0) hash; None when not computed
+        # or when the section is not a normalizable PE (e.g. TE / non-PE).
+        self.SHA256_NORM = None
 
         # a list of children EFI_MODULE nodes to build the EFI_MODULE object model
         self.children = []
@@ -211,9 +343,11 @@ class EFI_MODULE:
             _s += f'\n{_ind}SHA1  : {self.SHA1}'
         if self.SHA256:
             _s += f'\n{_ind}SHA256: {self.SHA256}'
+        if self.SHA256_NORM:
+            _s += f'\n{_ind}SHA256_NORM: {self.SHA256_NORM}'
         return bytestostring(_s)
 
-    def calc_hashes(self, off: int = 0) -> None:
+    def calc_hashes(self, off: int = 0, normalize: bool = False) -> None:
         if self.Image is None:
             return
         hmd5 = hashlib.md5()
@@ -225,6 +359,14 @@ class EFI_MODULE:
         hsha256 = hashlib.sha256()
         hsha256.update(self.Image[off:])
         self.SHA256 = hsha256.hexdigest()
+        # Additive, optional rebase-0 hash. Leaves SHA256_NORM = None for TE /
+        # non-PE / unparsable sections (skip, never fake).
+        if normalize:
+            normalized = normalize_pe_rebase0(self.Image[off:])
+            if normalized is not None:
+                hsha256n = hashlib.sha256()
+                hsha256n.update(normalized)
+                self.SHA256_NORM = hsha256n.hexdigest()
 
 
 class EFI_FV(EFI_MODULE):

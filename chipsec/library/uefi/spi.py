@@ -161,7 +161,9 @@ def build_efi_modules_tree(fwtype: Optional[str], data: bytes, Size: int, offset
 
         if sec.Type in EFI_SECTIONS_EXE:
             # "leaf" executable section: update hashes and check against match criteria
-            sec.calc_hashes(sec.HeaderSize)
+            # normalize=True additionally computes the optional rebase-0 hash
+            # (SHA256_NORM); it is left as None for TE / non-PE sections.
+            sec.calc_hashes(sec.HeaderSize, normalize=True)
         elif sec.Type == EFI_SECTION_USER_INTERFACE:
             # "leaf" UI section: update section's UI name
             try:
@@ -447,6 +449,8 @@ def dump_efi_module(mod, parent: Optional['EFI_MODULE'], modn: int, path: str) -
             write_file(f'{mod_path}.sha1', mod.SHA1)
         if mod.SHA256:
             write_file(f'{mod_path}.sha256', mod.SHA256)
+        if mod.SHA256_NORM:
+            write_file(f'{mod_path}.sha256_norm', mod.SHA256_NORM)
     return mod_path
 
 

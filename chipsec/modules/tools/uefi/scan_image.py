@@ -30,6 +30,10 @@ Usage:
                         executables (default = ``efilist.json``)
     - ``fw_image``	Full file path to UEFI firmware image. If not specified,
                         the module will dump firmware image directly from ROM
+    - ``norm``		Optional. When present, an additive ``sha256_norm``
+                        (rebase-0, layout-independent) value field is written to
+                        each ``efilist.json`` entry. The ``sha256``-as-key schema
+                        and ``check`` behavior are unchanged.
 
 Examples:
 
@@ -42,6 +46,11 @@ image extracted from ROM
 
 Creates a list of EFI executable binaries in ``efilist.json`` from ``uefi.rom``
 firmware binary
+
+>>> chipsec_main -i -n -m tools.uefi.scan_image -a generate,efilist.json,uefi.rom,norm
+
+Same as above but also records a normalized ``sha256_norm`` hash for each entry,
+comparable across flash layouts and against build-time (SBOM) hashes
 
 >>> chipsec_main -i -n -m tools.uefi.scan_image -a check,efilist.json,uefi.rom
 
@@ -81,6 +90,9 @@ class scan_image(BaseModule):
         self.efi_list = {}
         self.suspect_modules = {}
         self.duplicate_list = []
+        # When True, an additive 'sha256_norm' (rebase-0) value field is written
+        # to each efilist entry. The sha256-as-key schema and 'check' are unchanged.
+        self.include_norm = False
 
     def is_supported(self):
         return True
@@ -99,6 +111,8 @@ class scan_image(BaseModule):
                 md["name"] = efi_module.ui_string
             if efi_module.Name:
                 md["type"] = efi_module.Name
+            if self.include_norm and efi_module.SHA256_NORM:
+                md["sha256_norm"] = efi_module.SHA256_NORM
             if efi_module.SHA256 in self.efi_list.keys():
                 self.duplicate_list.append(efi_module.SHA256)
             else:
@@ -160,6 +174,9 @@ class scan_image(BaseModule):
         self.res = ModuleResult.NOTAPPLICABLE
 
         op = module_argv[0] if len(module_argv) > 0 else 'generate'
+
+        # Optional, additive: emit a rebase-0 'sha256_norm' value field per entry.
+        self.include_norm = 'norm' in module_argv
 
         if op in ['generate', 'check']:
 
