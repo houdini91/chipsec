@@ -24,7 +24,7 @@ UEFI Firmware Volume Parsing/Modification Functionality
 
 import hashlib
 import struct
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from uuid import UUID
 from chipsec.library.defines import bytestostring
 from chipsec.library.uefi.common import get_3b_size, bit_set, align
@@ -189,17 +189,25 @@ IMAGE_DOS_SIGNATURE = 0x5A4D            # 'MZ'
 IMAGE_NT_OPTIONAL_HDR32_MAGIC = 0x10B   # PE32
 IMAGE_NT_OPTIONAL_HDR64_MAGIC = 0x20B   # PE32+
 IMAGE_DIRECTORY_ENTRY_BASERELOC = 5
+IMAGE_FILE_RELOCS_STRIPPED = 0x0001     # FileHeader.Characteristics
 
 IMAGE_REL_BASED_ABSOLUTE = 0            # padding, no fixup
 IMAGE_REL_BASED_HIGHLOW = 3            # 32-bit fixup
 IMAGE_REL_BASED_DIR64 = 10             # 64-bit fixup
 
 
-def _rva_to_offset(rva: int, sections: list) -> Optional[int]:
-    """Map a relative virtual address to a raw file offset using the section table."""
-    for va, vsize, praw, rsize in sections:
-        span = vsize if vsize > rsize else rsize
-        if va <= rva < va + span:
+def _rva_to_offset(rva: int, sections: List[Tuple[int, int, int, int]]) -> Optional[int]:
+    """Map a relative virtual address to a raw file offset using the section table.
+
+    A section maps an RVA only if it has bytes in the file, and only within
+    SizeOfRawData. Widening the span to max(VirtualSize, SizeOfRawData) would map an
+    RVA in a section's virtual-only tail onto whatever follows it in the file --
+    normally the next section -- and yield a confident, wrong normalization.
+    """
+    for va, _vsize, praw, rsize in sections:
+        if praw == 0 or rsize == 0:
+            continue
+        if va <= rva < va + rsize:
             return rva - va + praw
     return None
 
@@ -258,13 +266,20 @@ def normalize_pe_rebase0(data: bytes) -> Optional[bytes]:
         if imagebase == 0:
             return bytes(buf)
 
+        # No relocation directory means one of two different things. If the module
+        # genuinely has no relocations, placing it changed only the ImageBase header
+        # field and zeroing that is the exact normalization. If the table was applied
+        # and then STRIPPED, the code still carries the load address and nothing records
+        # which words were shifted -- so the placement cannot be reversed and no value
+        # may be emitted. IMAGE_FILE_RELOCS_STRIPPED distinguishes them.
+        relocs_stripped = bool(struct.unpack_from('<H', data, coff + 18)[0] & IMAGE_FILE_RELOCS_STRIPPED)
         num_rva = struct.unpack_from('<I', data, numrva_off)[0]
         if num_rva <= IMAGE_DIRECTORY_ENTRY_BASERELOC:
-            return bytes(buf)
+            return None if relocs_stripped else bytes(buf)
         reloc_dd = dd_off + IMAGE_DIRECTORY_ENTRY_BASERELOC * 8
         reloc_rva, reloc_size = struct.unpack_from('<II', data, reloc_dd)
         if reloc_rva == 0 or reloc_size == 0:
-            return bytes(buf)
+            return None if relocs_stripped else bytes(buf)
 
         sec_tbl = opt + size_opt
         sections = []
