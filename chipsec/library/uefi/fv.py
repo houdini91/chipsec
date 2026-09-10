@@ -191,9 +191,35 @@ IMAGE_NT_OPTIONAL_HDR64_MAGIC = 0x20B   # PE32+
 IMAGE_DIRECTORY_ENTRY_BASERELOC = 5
 IMAGE_FILE_RELOCS_STRIPPED = 0x0001     # FileHeader.Characteristics
 
+# EFI_TE_IMAGE_HEADER (PI spec; MdePkg/Include/IndustryStandard/PeImage.h). Defined here
+# rather than imported from chipsec/modules/tools/secureboot/te.py: nothing under
+# chipsec/library or chipsec/hal imports from chipsec/modules, and te.py pulls in
+# BaseModule, which would make FV parsing depend on the module framework.
+TE_IMAGE_SIGNATURE = 0x5A56             # 'VZ'
+TE_IMAGE_HEADER_SIZE = 40
+TE_OFF_NUM_SECTIONS = 4                 # uint8
+TE_OFF_STRIPPED_SIZE = 6                # uint16
+TE_OFF_IMAGE_BASE = 16                  # uint64
+TE_OFF_BASERELOC_DIR = 24               # DataDirectory[0] = {VirtualAddress, Size}
+
 IMAGE_REL_BASED_ABSOLUTE = 0            # padding, no fixup
 IMAGE_REL_BASED_HIGHLOW = 3            # 32-bit fixup
 IMAGE_REL_BASED_DIR64 = 10             # 64-bit fixup
+
+
+def _zero_section_pointers(buf: bytearray, sec_tbl: int, num_sections: int) -> None:
+    """Zero PointerToRelocations and PointerToLinenumbers in every section header.
+
+    Both are COFF object-file fields and are zero in every linked image, but they are
+    not inert: GenFw's rebase stores the assigned load address as a UINT64 across the
+    pair of the first non-code section. That is a second copy of the placement, which
+    is precisely what this function exists to remove.
+    """
+    for i in range(num_sections):
+        sh = sec_tbl + i * 40
+        if sh + 40 > len(buf):
+            break
+        struct.pack_into('<Q', buf, sh + 24, 0)
 
 
 def _rva_to_offset(rva: int, sections: List[Tuple[int, int, int, int]]) -> Optional[int]:
@@ -262,6 +288,7 @@ def normalize_pe_rebase0(data: bytes) -> Optional[bytes]:
         struct.pack_into(ib_fmt, buf, imagebase_off, 0)   # OptionalHeader.ImageBase
         struct.pack_into('<I', buf, coff + 4, 0)          # FileHeader.TimeDateStamp
         struct.pack_into('<I', buf, opt + 64, 0)          # OptionalHeader.CheckSum
+        _zero_section_pointers(buf, opt + size_opt, num_sections)
         # Already rebase-0: no relocation fixups to reverse.
         if imagebase == 0:
             return bytes(buf)
@@ -332,6 +359,102 @@ def normalize_pe_rebase0(data: bytes) -> Optional[bytes]:
                     # Unsupported relocation type: cannot normalize safely.
                     return None
             pos += block_size
+        return bytes(buf)
+    except (struct.error, IndexError):
+        return None
+
+
+def _te_rva_to_offset(rva: int, sections: List[Tuple[int, int, int, int]], tso: int) -> Optional[int]:
+    """RVA -> offset inside a TE image.
+
+    A TE file is the original PE with its first StrippedSize bytes replaced by a
+    40-byte header, so every original-PE offset moves down by (StrippedSize - 40).
+    The section table keeps original-PE coordinates, so this is the PE rule plus
+    that one constant.
+    """
+    off = _rva_to_offset(rva, sections)
+    if off is None:
+        return None
+    off -= tso
+    return off if off >= 0 else None
+
+
+def normalize_te_rebase0(data: bytes) -> Optional[bytes]:
+    """Return a rebase-0 normalized copy of a TE image, or None.
+
+    The TE sibling of normalize_pe_rebase0. A TE header carries no TimeDateStamp and
+    no CheckSum, so ImageBase is the only header field to clear. Returns None for
+    non-TE / unparsable / unsupported input (skip, never fake).
+    """
+    try:
+        if len(data) < TE_IMAGE_HEADER_SIZE:
+            return None
+        if struct.unpack_from('<H', data, 0)[0] != TE_IMAGE_SIGNATURE:
+            return None
+        num_sections = data[TE_OFF_NUM_SECTIONS]
+        stripped = struct.unpack_from('<H', data, TE_OFF_STRIPPED_SIZE)[0]
+        if stripped <= TE_IMAGE_HEADER_SIZE:
+            return None
+        tso = stripped - TE_IMAGE_HEADER_SIZE
+        imagebase = struct.unpack_from('<Q', data, TE_OFF_IMAGE_BASE)[0]
+        reloc_rva, reloc_size = struct.unpack_from('<II', data, TE_OFF_BASERELOC_DIR)
+
+        buf = bytearray(data)
+        if imagebase != 0:
+            if reloc_size == 0:
+                # A TE has no Characteristics, so it cannot carry
+                # IMAGE_FILE_RELOCS_STRIPPED. GenFw encodes the same fact in the
+                # directory: a bogus NON-ZERO VirtualAddress with Size 0 means
+                # "relocatable, no fixups", because loaders read an all-zero entry
+                # as "relocations stripped". Stripped cannot be reversed.
+                if reloc_rva == 0:
+                    return None
+            else:
+                sections = []
+                for i in range(num_sections):
+                    sh = TE_IMAGE_HEADER_SIZE + i * 40
+                    if sh + 40 > len(data):
+                        return None
+                    vsize = struct.unpack_from('<I', data, sh + 8)[0]
+                    va = struct.unpack_from('<I', data, sh + 12)[0]
+                    rsize = struct.unpack_from('<I', data, sh + 16)[0]
+                    praw = struct.unpack_from('<I', data, sh + 20)[0]
+                    sections.append((va, vsize, praw, rsize))
+
+                start = _te_rva_to_offset(reloc_rva, sections, tso)
+                if start is None or start + reloc_size > len(buf):
+                    return None
+                pos, end = start, start + reloc_size
+                while pos + 8 <= end:
+                    page_rva, block_size = struct.unpack_from('<II', data, pos)
+                    if block_size == 0:
+                        break
+                    if block_size < 8 or pos + block_size > end or (block_size - 8) % 2:
+                        return None
+                    for off in range(pos + 8, pos + block_size, 2):
+                        entry = struct.unpack_from('<H', data, off)[0]
+                        rtype, roff = entry >> 12, entry & 0xFFF
+                        if rtype == IMAGE_REL_BASED_ABSOLUTE:
+                            continue
+                        if rtype not in (IMAGE_REL_BASED_HIGHLOW, IMAGE_REL_BASED_DIR64):
+                            return None
+                        target = _te_rva_to_offset(page_rva + roff, sections, tso)
+                        if target is None:
+                            return None
+                        if rtype == IMAGE_REL_BASED_HIGHLOW:
+                            if target + 4 > len(buf):
+                                return None
+                            value = struct.unpack_from('<I', buf, target)[0]
+                            struct.pack_into('<I', buf, target, (value - imagebase) & 0xFFFFFFFF)
+                        else:
+                            if target + 8 > len(buf):
+                                return None
+                            value = struct.unpack_from('<Q', buf, target)[0]
+                            struct.pack_into('<Q', buf, target, (value - imagebase) & ((1 << 64) - 1))
+                    pos += block_size
+
+        _zero_section_pointers(buf, TE_IMAGE_HEADER_SIZE, num_sections)
+        struct.pack_into('<Q', buf, TE_OFF_IMAGE_BASE, 0)
         return bytes(buf)
     except (struct.error, IndexError):
         return None
