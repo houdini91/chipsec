@@ -438,6 +438,13 @@ def FILENAME(mod: Union[EFI_FILE, EFI_SECTION], parent: Optional['EFI_MODULE'], 
     return fname
 
 
+# Attributes kept out of the decoded <image>.UEFI.json. Image and indent are
+# internal bookkeeping. The normalized-hash fields belong to scan_image's efilist
+# schema, not to decode's output, which is a separate and long-standing contract:
+# adding keys to it would change what every existing consumer of a decode sees.
+_DUMP_EXCLUDED_ATTRS = ('Image', 'indent', 'SHA256_NORM', 'SHA256_NORM_PROFILE')
+
+
 def dump_efi_module(mod, parent: Optional['EFI_MODULE'], modn: int, path: str) -> str:
     fname = FILENAME(mod, parent, modn)
     mod_path = os.path.join(path, fname)
@@ -449,8 +456,6 @@ def dump_efi_module(mod, parent: Optional['EFI_MODULE'], modn: int, path: str) -
             write_file(f'{mod_path}.sha1', mod.SHA1)
         if mod.SHA256:
             write_file(f'{mod_path}.sha256', mod.SHA256)
-        if mod.SHA256_NORM:
-            write_file(f'{mod_path}.sha256_norm', mod.SHA256_NORM)
     return mod_path
 
 
@@ -512,8 +517,8 @@ def save_efi_tree(modules: List['EFI_MODULE'],
             md[a] = getattr(m, a)
         md["class"] = type(m).__name__
         # remove extra attributes
-        for f in ["Image", "indent"]:
-            del md[f]
+        for f in _DUMP_EXCLUDED_ATTRS:
+            md.pop(f, None)
 
         # save EFI module image, make sub-directory for children
         if save_modules:
@@ -636,8 +641,8 @@ def save_efi_tree_filetype(modules: List['EFI_MODULE'],
             md[a] = getattr(m, a)
         md["class"] = type(m).__name__
         # remove extra attributes
-        for f in ["Image", "indent"]:
-            del md[f]
+        for f in _DUMP_EXCLUDED_ATTRS:
+            md.pop(f, None)
 
         # save EFI module image, make sub-directory for children
         if (isinstance(m, EFI_FILE) and m.Type in filetype) or save:
