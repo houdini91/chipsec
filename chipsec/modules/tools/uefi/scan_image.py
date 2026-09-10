@@ -30,10 +30,15 @@ Usage:
                         executables (default = ``efilist.json``)
     - ``fw_image``	Full file path to UEFI firmware image. If not specified,
                         the module will dump firmware image directly from ROM
-    - ``norm``		Optional. When present, an additive ``sha256_norm``
-                        (rebase-0, layout-independent) value field is written to
-                        each ``efilist.json`` entry. The ``sha256``-as-key schema
-                        and ``check`` behavior are unchanged.
+    - ``norm``		Optional. When present, two additive fields are written to
+                        each ``efilist.json`` entry: ``sha256_norm``, a rebase-0
+                        layout-independent hash, and ``sha256_norm_profile``,
+                        naming the normalization that produced it
+                        (``uefi-pe-rebase0.v1`` for PE32 sections,
+                        ``uefi-te-rebase0.v1`` for TE). The two are never equal
+                        for the same module, so the profile is what makes a
+                        value safe to compare. The ``sha256``-as-key schema and
+                        ``check`` behavior are unchanged.
 
 Examples:
 
@@ -49,8 +54,9 @@ firmware binary
 
 >>> chipsec_main -i -n -m tools.uefi.scan_image -a generate,efilist.json,uefi.rom,norm
 
-Same as above but also records a normalized ``sha256_norm`` hash for each entry,
-comparable across flash layouts and against build-time (SBOM) hashes
+Same as above but also records a normalized ``sha256_norm`` hash and the
+``sha256_norm_profile`` that produced it, comparable across flash layouts and
+against build-time (SBOM) hashes
 
 >>> chipsec_main -i -n -m tools.uefi.scan_image -a check,efilist.json,uefi.rom
 
@@ -114,6 +120,10 @@ class scan_image(BaseModule):
                 md["type"] = efi_module.Name
             if self.include_norm and efi_module.SHA256_NORM:
                 md["sha256_norm"] = efi_module.SHA256_NORM
+                # which normalization produced it: a PE32 digest and a TE digest of
+                # the same module are both correct and never equal, so an unlabelled
+                # value cannot be compared against anything safely
+                md["sha256_norm_profile"] = efi_module.SHA256_NORM_PROFILE
             if efi_module.SHA256 in self.efi_list.keys():
                 self.duplicate_list.append(efi_module.SHA256)
             else:
@@ -126,7 +136,7 @@ class scan_image(BaseModule):
     #
     def generate_efilist(self, json_pth: str) -> int:
         self.logger.log("[*] Generating a list of EFI executables from firmware image...")
-        efi_tree = build_efi_model(self.image, None)
+        efi_tree = build_efi_model(self.image, None, self.include_norm)
         search_efi_tree(efi_tree, self.genlist_callback, EFIModuleType.SECTION_EXE, True)
         self.logger.log(f'[*] Found {len(self.efi_list):d} EFI executables in UEFI firmware image \'{self.image_file}\'')
         self.logger.log(f'[*] Found {len(self.duplicate_list)} duplicate executables')
@@ -147,7 +157,7 @@ class scan_image(BaseModule):
         # parse the UEFI firmware image and look for EFI modules matching list
         # - match only executable EFI sections (PE/COFF, TE)
         # - find all occurrences of matching EFI modules
-        efi_tree = build_efi_model(self.image, None)
+        efi_tree = build_efi_model(self.image, None, self.include_norm)
         search_efi_tree(efi_tree, self.genlist_callback, EFIModuleType.SECTION_EXE, True)
         self.logger.log(f'[*] Found {len(self.efi_list):d} EFI executables in UEFI firmware image \'{self.image_file}\'')
 

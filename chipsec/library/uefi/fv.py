@@ -195,6 +195,12 @@ IMAGE_FILE_RELOCS_STRIPPED = 0x0001     # FileHeader.Characteristics
 # rather than imported from chipsec/modules/tools/secureboot/te.py: nothing under
 # chipsec/library or chipsec/hal imports from chipsec/modules, and te.py pulls in
 # BaseModule, which would make FV parsing depend on the module framework.
+# Identifiers for the normalization each function implements. A consumer holding two
+# digests cannot tell whether they are comparable unless it is told which produced
+# them, and a PE32 digest and a TE digest of the same module are never equal.
+NORM_PROFILE_PE = 'uefi-pe-rebase0.v1'
+NORM_PROFILE_TE = 'uefi-te-rebase0.v1'
+
 TE_IMAGE_SIGNATURE = 0x5A56             # 'VZ'
 TE_IMAGE_HEADER_SIZE = 40
 TE_OFF_NUM_SECTIONS = 4                 # uint8
@@ -479,6 +485,7 @@ class EFI_MODULE:
         # Optional layout-independent (rebase-0) hash; None when not computed
         # or when the section is not a normalizable PE (e.g. TE / non-PE).
         self.SHA256_NORM = None
+        self.SHA256_NORM_PROFILE = None
 
         # a list of children EFI_MODULE nodes to build the EFI_MODULE object model
         self.children = []
@@ -517,11 +524,18 @@ class EFI_MODULE:
         # Additive, optional rebase-0 hash. Leaves SHA256_NORM = None for TE /
         # non-PE / unparsable sections (skip, never fake).
         if normalize:
-            normalized = normalize_pe_rebase0(self.Image[off:])
+            payload = self.Image[off:]
+            normalized, profile = None, None
+            if len(payload) >= 2:
+                if payload[:2] == b'MZ':
+                    normalized, profile = normalize_pe_rebase0(payload), NORM_PROFILE_PE
+                elif struct.unpack_from('<H', payload, 0)[0] == TE_IMAGE_SIGNATURE:
+                    normalized, profile = normalize_te_rebase0(payload), NORM_PROFILE_TE
             if normalized is not None:
                 hsha256n = hashlib.sha256()
                 hsha256n.update(normalized)
                 self.SHA256_NORM = hsha256n.hexdigest()
+                self.SHA256_NORM_PROFILE = profile
 
 
 class EFI_FV(EFI_MODULE):
