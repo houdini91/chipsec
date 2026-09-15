@@ -186,8 +186,16 @@ class scan_image(BaseModule):
 
         op = module_argv[0] if len(module_argv) > 0 else 'generate'
 
-        # Optional, additive: emit a rebase-0 'sha256_norm' value field per entry.
-        self.include_norm = 'norm' in module_argv
+        # Optional, additive: emit the rebase-0 'sha256_norm' fields per entry.
+        # Positional, matching how the rest of this module parses its arguments: a
+        # membership test over the whole argv would also fire on a file that happens
+        # to be named 'norm', and would accept it in places it does nothing.
+        self.include_norm = len(module_argv) > 3 and module_argv[3] == 'norm'
+        if self.include_norm and op == 'check':
+            # check compares on the sha256 key alone, so the field it would add is
+            # never read back. Say so rather than accepting the argument silently.
+            self.logger.log_warning("'norm' has no effect on 'check'; it applies to 'generate'")
+            self.include_norm = False
 
         if op in ['generate', 'check']:
 

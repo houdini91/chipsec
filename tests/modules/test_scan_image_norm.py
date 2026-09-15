@@ -126,3 +126,43 @@ class TestCheckListUnaffectedByNorm(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestNormArgumentParsing(unittest.TestCase):
+    """'norm' is positional, and only means something on 'generate'."""
+
+    def _include_norm_for(self, argv):
+        module = _new_scan_image(False)
+        module.res = ModuleResult.NOTAPPLICABLE
+        # run() reaches for the filesystem and the chipset after parsing, so stop it
+        # once the flag has been decided
+        with patch.object(scan_image, 'usage', lambda self: None), \
+             patch('chipsec.modules.tools.uefi.scan_image.read_file', side_effect=RuntimeError('stop')):
+            try:
+                module.run(argv)
+            except RuntimeError:
+                pass
+        return module.include_norm
+
+    def test_norm_in_the_documented_position_enables_it(self):
+        self.assertTrue(self._include_norm_for(['generate', 'efilist.json', 'uefi.rom', 'norm']))
+
+    def test_absent_norm_leaves_it_off(self):
+        self.assertFalse(self._include_norm_for(['generate', 'efilist.json', 'uefi.rom']))
+
+    def test_a_file_named_norm_does_not_enable_it(self):
+        # a membership test over argv would fire on this
+        self.assertFalse(self._include_norm_for(['generate', 'norm', 'uefi.rom']))
+
+    def test_norm_on_check_is_refused_and_reported(self):
+        # check compares on the sha256 key alone, so the field would never be read
+        module = _new_scan_image(False)
+        module.res = ModuleResult.NOTAPPLICABLE
+        with patch.object(scan_image, 'usage', lambda self: None), \
+             patch('chipsec.modules.tools.uefi.scan_image.read_file', side_effect=RuntimeError('stop')):
+            try:
+                module.run(['check', 'efilist.json', 'uefi.rom', 'norm'])
+            except RuntimeError:
+                pass
+        self.assertFalse(module.include_norm)
+        self.assertTrue(module.logger.log_warning.called)

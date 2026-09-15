@@ -30,7 +30,10 @@ from chipsec.library.uefi.fv import (
     EFI_SECTION,
     EFI_SECTION_PE32,
     EFI_SECTION_TE,
+    NORM_PROFILE_PE,
+    NORM_PROFILE_TE,
     normalize_pe_rebase0,
+    normalize_te_rebase0,
 )
 
 # File layout shared by all synthetic images (see _build_pe).
@@ -135,6 +138,36 @@ def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _build_te(image_base: int = 0, with_reloc: bool = True, strip_relocs: bool = False) -> bytes:
+    """A TE image, built from _build_pe the way GenFw -t builds one.
+
+    GenFw discards the bytes before the section table and prepends a 40-byte
+    EFI_TE_IMAGE_HEADER, so StrippedSize is the section table's offset in the PE
+    and every RVA then resolves (StrippedSize - 40) lower than it did.
+    """
+    pe = _build_pe(image_base, pe_plus=True, with_reloc=with_reloc)
+    e_lfanew = struct.unpack_from('<I', pe, 0x3C)[0]
+    fh = e_lfanew + 4
+    oh = fh + 20
+    num_sections = struct.unpack_from('<H', pe, fh + 2)[0]
+    stripped = oh + struct.unpack_from('<H', pe, fh + 16)[0]
+    machine = struct.unpack_from('<H', pe, fh)[0]
+    entry = struct.unpack_from('<I', pe, oh + 16)[0]
+    base_of_code = struct.unpack_from('<I', pe, oh + 20)[0]
+    num_rva = struct.unpack_from('<I', pe, oh + 108)[0]
+    if num_rva > 5 and not strip_relocs:
+        reloc = struct.unpack_from('<II', pe, oh + 112 + 5 * 8)
+    else:
+        reloc = (0, 0)
+    debug = (0, 0)
+
+    hdr = struct.pack('<HHBBHIIQ', 0x5A56, machine, num_sections, 0,
+                      stripped, entry, base_of_code, image_base)
+    hdr += struct.pack('<II', *reloc) + struct.pack('<II', *debug)
+    assert len(hdr) == 40
+    return hdr + pe[stripped:]
+
+
 class TestNormalizePeRebase0(unittest.TestCase):
     """Cover normalize_pe_rebase0 directly."""
 
@@ -219,12 +252,25 @@ class TestCalcHashesNormalize(unittest.TestCase):
         sec.calc_hashes(0, normalize=True)
         self.assertEqual(sec.SHA256_NORM, sec.SHA256)
 
-    def test_te_leaves_norm_none(self):
+    def test_malformed_te_leaves_norm_none(self):
+        # StrippedSize of 0 cannot be right -- the section table alone sits above it
         sec = self._section(b'VZ' + b'\x00' * 0x100, sec_type=EFI_SECTION_TE)
         sec.calc_hashes(0, normalize=True)
         self.assertIsNone(sec.SHA256_NORM)
+        self.assertIsNone(sec.SHA256_NORM_PROFILE)
         # The as-found SHA256 is still computed for TE sections.
         self.assertIsNotNone(sec.SHA256)
+
+    def test_te_section_is_normalized_and_labelled(self):
+        sec = self._section(_build_te(0x140000000), sec_type=EFI_SECTION_TE)
+        sec.calc_hashes(0, normalize=True)
+        self.assertIsNotNone(sec.SHA256_NORM)
+        self.assertEqual(sec.SHA256_NORM_PROFILE, NORM_PROFILE_TE)
+
+    def test_pe_section_carries_the_pe_profile(self):
+        sec = self._section(_build_pe(0x140000000, pe_plus=True))
+        sec.calc_hashes(0, normalize=True)
+        self.assertEqual(sec.SHA256_NORM_PROFILE, NORM_PROFILE_PE)
 
     def test_normalize_false_leaves_norm_none(self):
         sec = self._section(_build_pe(0x140000000, pe_plus=True))
@@ -235,3 +281,88 @@ class TestCalcHashesNormalize(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestNormalizeTeRebase0(unittest.TestCase):
+    """uefi-te-rebase0.v1: the TE sibling of the PE normalization."""
+
+    def test_stable_across_imagebase(self):
+        # the whole point: the same module placed anywhere normalizes identically
+        base0 = normalize_te_rebase0(_build_te(0))
+        self.assertIsNotNone(base0)
+        for image_base in (0x820000, 0x140000000, 0xFFE00000):
+            self.assertEqual(normalize_te_rebase0(_build_te(image_base)), base0)
+
+    def test_imagebase_is_zeroed(self):
+        norm = normalize_te_rebase0(_build_te(0x140000000))
+        self.assertEqual(struct.unpack_from('<Q', norm, 16)[0], 0)
+
+    def test_stripped_relocations_emit_no_value(self):
+        # a TE has no Characteristics, so an all-zero relocation directory is how
+        # "the table was applied and discarded" is expressed. It cannot be reversed.
+        self.assertIsNone(normalize_te_rebase0(_build_te(0x140000000, strip_relocs=True)))
+
+    def test_sentinel_directory_still_normalizes(self):
+        # non-zero VirtualAddress with Size 0 is GenFw's marker for "relocatable,
+        # no fixups", which is an absence rather than a removal
+        te = bytearray(_build_te(0x140000000))
+        struct.pack_into('<I', te, 28, 0)          # Size = 0, VirtualAddress kept
+        norm = normalize_te_rebase0(bytes(te))
+        self.assertIsNotNone(norm)
+        self.assertEqual(struct.unpack_from('<Q', norm, 16)[0], 0)
+
+    def test_strippedsize_not_greater_than_header_emits_no_value(self):
+        te = bytearray(_build_te(0x140000000))
+        struct.pack_into('<H', te, 6, 40)
+        self.assertIsNone(normalize_te_rebase0(bytes(te)))
+
+    def test_odd_blocksize_emits_no_value(self):
+        te = bytearray(_build_te(0x140000000))
+        stripped = struct.unpack_from('<H', te, 6)[0]
+        tso = stripped - 40
+        rva = struct.unpack_from('<I', te, 24)[0]
+        # the section table keeps original-PE coordinates, so the directory's own
+        # RVA resolves through it before the TE adjustment
+        off = None
+        for i in range(te[4]):
+            sh = 40 + i * 40
+            vaddr, rsize, praw = (struct.unpack_from('<I', te, sh + 12)[0],
+                                  struct.unpack_from('<I', te, sh + 16)[0],
+                                  struct.unpack_from('<I', te, sh + 20)[0])
+            if praw and rsize and vaddr <= rva < vaddr + rsize:
+                off = praw + (rva - vaddr) - tso
+                break
+        self.assertIsNotNone(off, 'could not locate the relocation directory')
+        # relocation blocks hold uint16 entries, so an odd size cannot be well formed
+        blk = struct.unpack_from('<I', te, off + 4)[0]
+        struct.pack_into('<I', te, off + 4, blk - 1)
+        self.assertIsNone(normalize_te_rebase0(bytes(te)))
+
+    def test_pe_input_returns_none(self):
+        self.assertIsNone(normalize_te_rebase0(_build_pe(0, pe_plus=True)))
+
+    def test_short_and_empty_input_return_none(self):
+        self.assertIsNone(normalize_te_rebase0(b''))
+        self.assertIsNone(normalize_te_rebase0(b'VZ'))
+
+
+class TestSectionPointerNormalization(unittest.TestCase):
+    """s4.2: a rebase leaves a copy of the load address in the section table."""
+
+    def test_pe_section_pointers_are_zeroed(self):
+        pe = bytearray(_build_pe(0x140000000, pe_plus=True))
+        e_lfanew = struct.unpack_from('<I', pe, 0x3C)[0]
+        fh = e_lfanew + 4
+        sec = fh + 20 + struct.unpack_from('<H', pe, fh + 16)[0]
+        # GenFw's rebase writes the load address across PointerToRelocations and
+        # PointerToLinenumbers of the first non-code section (GenFw.c:966-972)
+        for i in range(struct.unpack_from('<H', pe, fh + 2)[0]):
+            sh = sec + i * 40
+            if not (struct.unpack_from('<I', pe, sh + 36)[0] & 0x20):
+                struct.pack_into('<Q', pe, sh + 24, 0x140000000)
+                break
+        else:
+            self.skipTest('synthetic image has no non-code section')
+        norm = normalize_pe_rebase0(bytes(pe))
+        self.assertIsNotNone(norm)
+        self.assertEqual(norm, normalize_pe_rebase0(_build_pe(0x140000000, pe_plus=True)))
