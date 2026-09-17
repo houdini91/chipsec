@@ -24,7 +24,7 @@ UEFI Firmware Volume Parsing/Modification Functionality
 
 import hashlib
 import struct
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from uuid import UUID
 from chipsec.library.defines import bytestostring
 from chipsec.library.uefi.common import get_3b_size, bit_set, align
@@ -174,6 +174,244 @@ VOLUME_SECTION_GUID = UUID("367AE684-335D-4671-A16D-899DBFEA6B88")
 EFI_FFS_VOLUME_TOP_FILE_GUID = UUID("1BA0062E-C779-4582-8566-336AE8F78F09")
 
 DEF_INDENT = "    "
+
+#
+# Rebase-0 normalization of PE32/PE32+ and TE images.
+#
+# The per-module SHA256 covers an executable section exactly as it sits in the
+# image, after the module was placed at its load address and its relocations were
+# applied, so it only matches another image with the same layout. The functions
+# below undo that placement: they reverse each base relocation fixup and zero the
+# header fields that record the load address. A module placed at two different
+# addresses then yields the same bytes, which can be compared across images and
+# against a build-time hash of the module at base 0.
+#
+# The rules, including every case that must produce no value, follow the
+# uefi-pe-rebase0.v1 and uefi-te-rebase0.v1 profiles:
+# https://github.com/houdini91/uefi-supply-chain/blob/813a665bdb28/docs/normalized-module-hash-profile.md
+#
+IMAGE_NT_OPTIONAL_HDR32_MAGIC = 0x10B   # PE32
+IMAGE_NT_OPTIONAL_HDR64_MAGIC = 0x20B   # PE32+
+IMAGE_DIRECTORY_ENTRY_BASERELOC = 5
+IMAGE_FILE_RELOCS_STRIPPED = 0x0001     # FileHeader.Characteristics
+IMAGE_SIZEOF_SECTION_HEADER = 40
+
+IMAGE_REL_BASED_ABSOLUTE = 0            # padding, no fixup
+IMAGE_REL_BASED_HIGHLOW = 3             # 32-bit fixup
+IMAGE_REL_BASED_DIR64 = 10              # 64-bit fixup
+
+# EFI_TE_IMAGE_HEADER (MdePkg/Include/IndustryStandard/PeImage.h). Defined here
+# rather than imported from chipsec/modules/tools/secureboot/te.py, which pulls in
+# BaseModule: nothing under chipsec/library imports from chipsec/modules.
+TE_IMAGE_HEADER_SIZE = 40
+TE_OFF_NUM_SECTIONS = 4                 # uint8
+TE_OFF_STRIPPED_SIZE = 6                # uint16
+TE_OFF_IMAGE_BASE = 16                  # uint64
+TE_OFF_BASERELOC_DIR = 24               # DataDirectory[0] = {VirtualAddress, Size}
+
+NORM_PROFILE_PE = 'uefi-pe-rebase0.v1'
+NORM_PROFILE_TE = 'uefi-te-rebase0.v1'
+
+
+def _read_sections(data: bytes, table: int, count: int) -> Optional[List[Tuple[int, int, int]]]:
+    """(VirtualAddress, SizeOfRawData, PointerToRawData) per section; None if the table overruns."""
+    if table + count * IMAGE_SIZEOF_SECTION_HEADER > len(data):
+        return None
+    sections = []
+    for i in range(count):
+        header = table + i * IMAGE_SIZEOF_SECTION_HEADER
+        va, raw_size, raw_ptr = struct.unpack_from('<III', data, header + 12)
+        sections.append((va, raw_size, raw_ptr))
+    return sections
+
+
+def _rva_to_offset(rva: int, sections: List[Tuple[int, int, int]],
+                   te_adjust: int = 0) -> Optional[int]:
+    """Map an RVA to a file offset, or None.
+
+    Only a section with bytes in the file maps an RVA, and only within
+    SizeOfRawData: an RVA in the part of a section that exists only once loaded has
+    nothing on disk. te_adjust is (StrippedSize - 40) for a TE image, whose section
+    table keeps the coordinates of the PE it was converted from.
+    """
+    for va, raw_size, raw_ptr in sections:
+        if raw_ptr == 0 or raw_size == 0:
+            continue
+        if va <= rva < va + raw_size:
+            offset = raw_ptr + (rva - va) - te_adjust
+            return offset if offset >= 0 else None
+    return None
+
+
+def _reverse_fixups(buf: bytearray, start: int, size: int, sections: List[Tuple[int, int, int]],
+                    image_base: int, te_adjust: int = 0) -> bool:
+    """Subtract image_base at every fixup in the relocation directory at buf[start:start + size].
+
+    Everything is read from buf as it is being patched, one fixup at a time, so a
+    fixup that lands on bytes read later is seen by that later read. Returns False
+    for anything that cannot be reversed exactly; buf is then partly patched and
+    must be discarded.
+    """
+    pos = start
+    end = start + size
+    while pos + 8 <= end:
+        page_rva, block_size = struct.unpack_from('<II', buf, pos)
+        if block_size == 0:
+            break
+        if block_size < 8 or pos + block_size > end or (block_size - 8) % 2:
+            return False
+        for entry_off in range(pos + 8, pos + block_size, 2):
+            entry = struct.unpack_from('<H', buf, entry_off)[0]
+            reloc_type = entry >> 12
+            if reloc_type == IMAGE_REL_BASED_ABSOLUTE:
+                continue
+            if reloc_type == IMAGE_REL_BASED_HIGHLOW:
+                fmt, mask = '<I', 0xFFFFFFFF
+            elif reloc_type == IMAGE_REL_BASED_DIR64:
+                fmt, mask = '<Q', 0xFFFFFFFFFFFFFFFF
+            else:
+                return False
+            target = _rva_to_offset(page_rva + (entry & 0x0FFF), sections, te_adjust)
+            if target is None or target + struct.calcsize(fmt) > len(buf):
+                return False
+            value = struct.unpack_from(fmt, buf, target)[0]
+            struct.pack_into(fmt, buf, target, (value - image_base) & mask)
+        pos += block_size
+    return True
+
+
+def _zero_section_pointers(buf: bytearray, table: int, count: int) -> None:
+    """Zero PointerToRelocations and PointerToLinenumbers in every section header.
+
+    Both are zero in a linked image, but GenFw's rebase writes the load address
+    across the pair in the first non-code section, which would otherwise survive
+    normalization.
+    """
+    for i in range(count):
+        struct.pack_into('<Q', buf, table + i * IMAGE_SIZEOF_SECTION_HEADER + 24, 0)
+
+
+def normalize_pe_rebase0(data: bytes) -> Optional[bytes]:
+    """Return a PE32/PE32+ image as it would be at ImageBase 0, or None.
+
+    Reverses every base relocation fixup, then zeroes ImageBase, TimeDateStamp,
+    CheckSum and the section headers' PointerToRelocations/PointerToLinenumbers.
+    Returns None whenever that cannot be done exactly, including an image whose
+    relocations were stripped after being applied.
+    """
+    try:
+        if len(data) < 0x40 or data[:2] != b'MZ':
+            return None
+        e_lfanew = struct.unpack_from('<I', data, 0x3C)[0]
+        if e_lfanew + 24 > len(data) or data[e_lfanew:e_lfanew + 4] != b'PE\x00\x00':
+            return None
+        coff = e_lfanew + 4
+        opt = coff + 20
+        if opt + 68 > len(data):
+            return None
+        magic = struct.unpack_from('<H', data, opt)[0]
+        if magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC:
+            base_fmt, base_off, dir_count_off, dir_off = '<I', opt + 28, opt + 92, opt + 96
+        elif magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC:
+            base_fmt, base_off, dir_count_off, dir_off = '<Q', opt + 24, opt + 108, opt + 112
+        else:
+            return None
+        image_base = struct.unpack_from(base_fmt, data, base_off)[0]
+        num_sections = struct.unpack_from('<H', data, coff + 2)[0]
+        sec_table = opt + struct.unpack_from('<H', data, coff + 16)[0]
+        sections = _read_sections(data, sec_table, num_sections)
+        if sections is None:
+            return None
+
+        buf = bytearray(data)
+        if image_base != 0:
+            reloc_rva = reloc_size = 0
+            if struct.unpack_from('<I', data, dir_count_off)[0] > IMAGE_DIRECTORY_ENTRY_BASERELOC:
+                reloc_entry = dir_off + IMAGE_DIRECTORY_ENTRY_BASERELOC * 8
+                reloc_rva, reloc_size = struct.unpack_from('<II', data, reloc_entry)
+            if reloc_rva == 0 or reloc_size == 0:
+                # No relocations to reverse. That is only safe if the module never had
+                # any: if they were applied and then stripped, the code still holds
+                # the load address and nothing records where.
+                characteristics = struct.unpack_from('<H', data, coff + 18)[0]
+                if characteristics & IMAGE_FILE_RELOCS_STRIPPED:
+                    return None
+            else:
+                start = _rva_to_offset(reloc_rva, sections)
+                if start is None or start + reloc_size > len(buf):
+                    return None
+                if not _reverse_fixups(buf, start, reloc_size, sections, image_base):
+                    return None
+
+        # Only after the fixups: one of them may have landed on these fields.
+        struct.pack_into(base_fmt, buf, base_off, 0)     # OptionalHeader.ImageBase
+        struct.pack_into('<I', buf, coff + 4, 0)         # FileHeader.TimeDateStamp
+        struct.pack_into('<I', buf, opt + 64, 0)         # OptionalHeader.CheckSum
+        _zero_section_pointers(buf, sec_table, num_sections)
+        return bytes(buf)
+    except struct.error:
+        return None
+
+
+def normalize_te_rebase0(data: bytes) -> Optional[bytes]:
+    """Return a TE image as it would be at ImageBase 0, or None.
+
+    The TE counterpart of normalize_pe_rebase0. A TE header has no TimeDateStamp or
+    CheckSum, so ImageBase and the section-header pointers are the only fields to
+    zero. A TE has no Characteristics either: an all-zero relocation directory is
+    how it records that relocations were stripped.
+    """
+    try:
+        if len(data) < TE_IMAGE_HEADER_SIZE or data[:2] != b'VZ':
+            return None
+        num_sections = data[TE_OFF_NUM_SECTIONS]
+        stripped_size = struct.unpack_from('<H', data, TE_OFF_STRIPPED_SIZE)[0]
+        if stripped_size <= TE_IMAGE_HEADER_SIZE:
+            return None
+        te_adjust = stripped_size - TE_IMAGE_HEADER_SIZE
+        image_base = struct.unpack_from('<Q', data, TE_OFF_IMAGE_BASE)[0]
+        reloc_rva, reloc_size = struct.unpack_from('<II', data, TE_OFF_BASERELOC_DIR)
+        sections = _read_sections(data, TE_IMAGE_HEADER_SIZE, num_sections)
+        if sections is None:
+            return None
+
+        buf = bytearray(data)
+        if image_base != 0:
+            if reloc_size == 0:
+                # GenFw writes a non-zero VirtualAddress with Size 0 to mean
+                # "relocatable, no fixups". Both zero means stripped.
+                if reloc_rva == 0:
+                    return None
+            else:
+                start = _rva_to_offset(reloc_rva, sections, te_adjust)
+                if start is None or start + reloc_size > len(buf):
+                    return None
+                if not _reverse_fixups(buf, start, reloc_size, sections, image_base, te_adjust):
+                    return None
+
+        _zero_section_pointers(buf, TE_IMAGE_HEADER_SIZE, num_sections)
+        struct.pack_into('<Q', buf, TE_OFF_IMAGE_BASE, 0)
+        return bytes(buf)
+    except struct.error:
+        return None
+
+
+def normalized_sha256(section_type: int, payload: bytes) -> Optional[str]:
+    """'<profile>:sha256:<hex>' for an EFI_SECTION_PE32 or EFI_SECTION_TE payload, else None.
+
+    The profile name is part of the value because a PE32 digest and a TE digest of
+    the same module never match, and for a module already at ImageBase 0 the digest
+    can equal the plain SHA-256: without the prefix the two would be indistinguishable.
+    """
+    if section_type == EFI_SECTION_PE32:
+        profile, normalized = NORM_PROFILE_PE, normalize_pe_rebase0(payload)
+    elif section_type == EFI_SECTION_TE:
+        profile, normalized = NORM_PROFILE_TE, normalize_te_rebase0(payload)
+    else:
+        return None
+    if normalized is None:
+        return None
+    return f'{profile}:sha256:{hashlib.sha256(normalized).hexdigest()}'
 
 
 class EFI_MODULE:
